@@ -1,0 +1,165 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>PMC Author Fetch</title>
+</head>
+<body>
+  <h1>PMC Author Fetch</h1>
+  <div class="controls">
+    <label>
+      Base Query
+      <input id="baseQueryInput" type="text" value='"cancer" AND "cell line"'>
+    </label>
+    <label>
+      Max Results (≤20)
+      <input id="retmaxInput" type="number" min="1" max="20" value="3">
+    </label>
+    <div class="date-range">
+      Date Range Used (last 5 years):
+      <span id="dateRangeDisplay"></span>
+    </div>
+    <button id="run">Run Search</button>
+  </div>
+  <pre id="log"></pre>
+
+  <script>
+    async function fetchXml(url) {
+      const resp = await fetch(url);
+      if (!resp.ok) throw new Error('HTTP error: \${resp.status}');
+      const txt = await resp.text();
+      const parser = new DOMParser();
+      const xml = parser.parseFromString(txt, "application/xml");
+      return xml;
+    }
+
+    function slugify(str) {
+      return str
+        .toLowerCase()
+        .replace(/[^a-z0-9]+/g, "_")
+        .replace(/^_+|_+$/g, "")
+        .replace(/_+/g, "_");
+    }
+
+    function log(...args) {
+      const p = document.getElementById("log");
+      p.textContent += args.join(" ") + "\n";
+    }
+
+    const baseQueryInput = document.getElementById("baseQueryInput");
+    const retmaxInput = document.getElementById("retmaxInput");
+    const dateRangeDisplay = document.getElementById("dateRangeDisplay");
+    dateRangeDisplay.textContent = buildDateRange();
+
+    function buildDateRange(yearsBack = 5) {
+      const today = new Date();
+      const past = new Date();
+      past.setFullYear(today.getFullYear() - yearsBack);
+      return `("${formatPDat(past)}"[PDat] : "${formatPDat(today)}"[PDat])`;
+    }
+
+    function formatPDat(date) {
+      const yyyy = date.getFullYear();
+      const mm = String(date.getMonth() + 1).padStart(2, "0");
+      const dd = String(date.getDate()).padStart(2, "0");
+      return `${yyyy}/${mm}/${dd}`;
+    }
+
+    document.getElementById("run").onclick = async () => {
+      try {
+        const baseQuery = baseQueryInput.value.trim() || `"cancer" AND "cell line"`;
+        const dateRange = buildDateRange();
+        dateRangeDisplay.textContent = dateRange;
+        let retmax = parseInt(retmaxInput.value, 10) || 1;
+        retmax = Math.min(Math.max(retmax, 1), 20);
+        retmaxInput.value = retmax;
+        const fullQuery = `(${baseQuery}) AND ${dateRange}`;
+        const encoded = encodeURIComponent(fullQuery);
+        const slug = slugify(baseQuery);
+
+        // 1. ESearch → get PMCIDs
+        const esearchUrl = `https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi?db=pmc&retmax=${retmax}&term=${encoded}`;
+        log("Fetching ESearch...");
+        const esearchXml = await fetchXml(esearchUrl);
+        const idEls = Array.from(esearchXml.querySelectorAll("Id"));
+        const pmcids = idEls.map(el => el.textContent);
+        log("PMCIDs found:", pmcids.join(", "));
+
+        const authorEntries = [];
+
+        // 2. For each PMC ID: EFetch → parse metadata + authors
+        for (const id of pmcids) {
+          log("Fetching PMC", id, "...");
+          const efetchUrl = `https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi?db=pmc&retmode=xml&id=${id}`;
+          try {
+            const doc = await fetchXml(efetchUrl);
+            const pmcid = doc.querySelector('article-id[pub-id-type="pmcid"]')?.textContent || "";
+            const doi = doc.querySelector('article-id[pub-id-type="doi"]')?.textContent || "";
+            const title = doc.querySelector("article-title")?.textContent || "";
+            const journal = doc.querySelector("journal-title")?.textContent || "";
+            const journalAbbrev = doc.querySelector("journal-id")?.textContent || "";
+            const articleElem = doc.querySelector("article");
+            const articleType = articleElem ? articleElem.getAttribute("article-type") : "";
+
+            const authors = Array.from(doc.querySelectorAll('contrib[contrib-type="author"]'));
+            if (authors.length === 0) {
+              log("No authors found for PMC", id);
+              continue;
+            }
+
+            authors.forEach((auth, idx) => {
+              const surname = auth.querySelector("surname")?.textContent || "";
+              const given = auth.querySelector("given-names")?.textContent || "";
+              const email = auth.querySelector("email")?.textContent || "";
+              const isLast = (idx === authors.length - 1);
+              authorEntries.push({
+                pmcid, doi, title,
+                journal, journalAbbrev,
+                articleType,
+                surname, given, email,
+                isLast
+              });
+            });
+
+            log("OK for PMC", id);
+          } catch (e) {
+            log("Error fetching/parsing PMC", id, ":", e);
+          }
+
+          // polite delay (avoid hammering API)
+          await new Promise(r => setTimeout(r, 500));
+        }
+
+        log("");
+        log("Total author entries:", authorEntries.length);
+        console.log(authorEntries);
+
+        // 3. Build CSV
+        const header = ["pmcid","doi","title","journal","journalAbbrev","articleType","surname","given","email","isLast"];
+        const lines = [ header.join(",") ];
+        for (const a of authorEntries) {
+          const row = header.map(h => {
+            const str = a[h] == null ? "" : String(a[h]);
+            return `"${str.replace(/"/g, '""')}"`;
+          }).join(",");
+          lines.push(row);
+        }
+        const csv = lines.join("\n");
+        // 4. Trigger download
+        const blob = new Blob([csv], { type: "text/csv" });
+        const url = URL.createObjectURL(blob);
+        const link = document.createElement("a");
+        link.href = url;
+        link.download = slug + "_authors.csv";
+        link.textContent = "Download CSV";
+        document.body.appendChild(link);
+
+        log("CSV ready for download.");
+      } catch (e) {
+        log("Fatal error:", e);
+        console.error(e);
+      }
+    };
+  </script>
+</body>
+</html>
